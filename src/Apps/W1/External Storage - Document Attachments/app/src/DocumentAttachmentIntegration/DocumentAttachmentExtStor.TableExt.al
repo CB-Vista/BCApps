@@ -56,7 +56,7 @@ tableextension 8750 "Document Attachment Ext.Stor." extends "Document Attachment
             Caption = 'Skip Delete On Copy';
             DataClassification = SystemMetadata;
             Editable = false;
-            ToolTip = 'Specifies whether to skip deletion of this attachment from external storage.';
+            ToolTip = 'Specifies the legacy copy flag. External file deletion is determined by remaining attachment references.';
         }
     }
 
