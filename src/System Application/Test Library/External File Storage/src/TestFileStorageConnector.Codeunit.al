@@ -6,6 +6,7 @@
 namespace System.TestLibraries.ExternalFileStorage;
 
 using System.ExternalFileStorage;
+using System.Utilities;
 
 codeunit 135814 "Test File Storage Connector" implements "External File Storage Connector"
 {
@@ -28,6 +29,8 @@ codeunit 135814 "Test File Storage Connector" implements "External File Storage 
     begin
         if FailOnGetFile then
             Error(FailedToGetFileErr);
+        if DownloadedFileContent.HasValue() then
+            DownloadedFileContent.CreateInStream(Stream);
     end;
 
     procedure CreateFile(AccountId: Guid; Path: Text; Stream: InStream);
@@ -138,8 +141,20 @@ codeunit 135814 "Test File Storage Connector" implements "External File Storage 
         exit('Lorem ipsum dolor sit amet, consectetur adipiscing elit. Duis ornare ante a est commodo interdum. Pellentesque eu diam maximus, faucibus neque ut, viverra leo. Praesent ullamcorper nibh ut pretium dapibus. Nullam eu dui libero. Etiam ac cursus metus.')
     end;
 
+    internal procedure SetFileContent(Content: Text)
+    var
+        ContentOutStream: OutStream;
+    begin
+        Clear(DownloadedFileContent);
+        if Content = '' then
+            exit;
+        DownloadedFileContent.CreateOutStream(ContentOutStream, TextEncoding::UTF8);
+        ContentOutStream.WriteText(Content);
+    end;
+
     var
         FileConnectorMock: Codeunit "File Connector Mock";
+        DownloadedFileContent: Codeunit "Temp Blob";
         FailOnGetFile: Boolean;
         FileExistsCallCount: Integer;
         LastDeletedFilePath: Text;

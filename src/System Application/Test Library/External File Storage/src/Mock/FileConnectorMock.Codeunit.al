@@ -32,6 +32,7 @@ codeunit 135810 "File Connector Mock"
         TestFileStorageConnector.ResetLastDeletedPath();
         TestFileStorageConnector.ResetFileExistsCallCount();
         TestFileStorageConnector.SetFailOnGetFile(false);
+        TestFileStorageConnector.SetFileContent('');
     end;
 
     procedure GetAccounts(var FileAccount: Record "File Account")
@@ -149,5 +150,16 @@ codeunit 135810 "File Connector Mock"
         TestFileStorageConnector: Codeunit "Test File Storage Connector";
     begin
         TestFileStorageConnector.SetFailOnGetFile(FailOnGetFile);
+    end;
+
+    /// <summary>
+    /// Sets the content returned by successful file retrievals. Empty content restores the default mock behavior.
+    /// </summary>
+    /// <param name="Content">The file content to return.</param>
+    procedure SetFileContent(Content: Text)
+    var
+        TestFileStorageConnector: Codeunit "Test File Storage Connector";
+    begin
+        TestFileStorageConnector.SetFileContent(Content);
     end;
 }

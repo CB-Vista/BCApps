@@ -7,6 +7,8 @@ namespace Microsoft.ExternalStorage.DocumentAttachments.Test;
 
 using Microsoft.ExternalStorage.DocumentAttachments;
 using Microsoft.Foundation.Attachment;
+using Microsoft.Purchases.Document;
+using Microsoft.Purchases.History;
 using System.Environment;
 using System.ExternalFileStorage;
 using System.TestLibraries.ExternalFileStorage;
@@ -295,13 +297,14 @@ codeunit 136820 "DA Ext. Storage Impl. Tests"
 
     [Test]
     [HandlerFunctions('ConfirmYesHandler')]
-    procedure DeleteSkippedWhenSkipDeleteOnCopyIsSet()
+    procedure DeleteRemovesLastReferenceWhenSkipDeleteOnCopyIsSet()
     var
         DocumentAttachment: Record "Document Attachment";
         DAExternalStorageImpl: Codeunit "DA External Storage Impl.";
         Result: Boolean;
+        ExternalFilePath: Text;
     begin
-        // [SCENARIO] Delete should be skipped when Skip Delete On Copy is set
+        // [SCENARIO] A legacy copy flag cannot prevent explicit deletion of the last external reference
         Initialize();
         SetupFileScenarioWithTestConnector();
         EnableFeatureWithDelete();
@@ -310,17 +313,17 @@ codeunit 136820 "DA Ext. Storage Impl. Tests"
         CreateExternallyStoredDocument(DocumentAttachment);
         DocumentAttachment."Skip Delete On Copy" := true;
         DocumentAttachment.Modify();
+        ExternalFilePath := DocumentAttachment."External File Path";
 
         // [WHEN] Delete is attempted
         Result := DAExternalStorageImpl.DeleteFromExternalStorage(DocumentAttachment);
 
-        // [THEN] Delete should fail (skipped)
-        Assert.IsFalse(Result, 'Delete should be skipped when Skip Delete On Copy is set');
+        // [THEN] The last external reference is removed despite the legacy flag
+        Assert.IsTrue(Result, 'Deleting the last external reference should succeed despite the legacy copy flag');
+        Assert.AreEqual(ExternalFilePath, FileConnectorMock.GetLastDeletedPath(), 'The last reference should delete the external file');
 
-        // [THEN] Document should still be marked as externally stored
-        DocumentAttachment.SetRecFilter();
-        DocumentAttachment.FindFirst();
-        Assert.IsTrue(DocumentAttachment."Stored Externally", 'Document should still be marked as stored externally');
+        // [THEN] External metadata is cleared
+        AssertExternalMetadataCleared(DocumentAttachment);
     end;
 
     [Test]
@@ -407,14 +410,13 @@ codeunit 136820 "DA Ext. Storage Impl. Tests"
 
     [Test]
     [HandlerFunctions('ConfirmYesHandler')]
-    procedure RecordDeleteKeepsBlobWhenSkipDeleteOnCopyIsSet()
+    procedure RecordDeleteRemovesLastBlobWhenSkipDeleteOnCopyIsSet()
     var
         DocumentAttachment: Record "Document Attachment";
         DAExternalStorageImpl: Codeunit "DA External Storage Impl.";
         ExternalFilePath: Text;
     begin
-        // [SCENARIO] When the row was created by an attachment copy, the blob is shared with the source
-        // and must NOT be deleted when the copy is removed.
+        // [SCENARIO] A legacy copy flag cannot prevent record deletion from removing an unshared blob
         Initialize();
         SetupFileScenarioWithTestConnector();
         EnableFeatureWithDelete();
@@ -431,9 +433,9 @@ codeunit 136820 "DA Ext. Storage Impl. Tests"
         // [WHEN] The row is deleted
         DocumentAttachment.Delete(true);
 
-        // [THEN] The subscriber must NOT invoke DeleteFile for this path
-        Assert.AreNotEqual(ExternalFilePath, FileConnectorMock.GetLastDeletedPath(),
-            'External connector DeleteFile should not be invoked when Skip Delete On Copy is set');
+        // [THEN] The subscriber deletes the last external reference despite the legacy flag
+        Assert.AreEqual(ExternalFilePath, FileConnectorMock.GetLastDeletedPath(),
+            'The last external reference should be deleted even when Skip Delete On Copy is set');
     end;
 
     [Test]
@@ -494,6 +496,247 @@ codeunit 136820 "DA Ext. Storage Impl. Tests"
         // [THEN] The subscriber must NOT invoke DeleteFile when the feature setting opts out
         Assert.AreNotEqual(ExternalFilePath, FileConnectorMock.GetLastDeletedPath(),
             'External connector DeleteFile should not be invoked when Delete from External Storage is disabled');
+    end;
+
+    #endregion
+
+    #region Shared External File Tests
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure QuoteToOrderCopyKeepsHeaderAndLineFilesAfterSourceCleanup()
+    begin
+        VerifyPurchaseCopyDeletionOrder(false, true, true);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure QuoteToOrderCopyKeepsHeaderAndLineFilesAfterDestinationCleanup()
+    begin
+        VerifyPurchaseCopyDeletionOrder(false, false, true);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure PostedInvoiceCopyKeepsHeaderAndLineFilesAfterSourceCleanup()
+    begin
+        VerifyPurchaseCopyDeletionOrder(true, true, true);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure PostedInvoiceCopyKeepsHeaderAndLineFilesAfterDestinationCleanup()
+    begin
+        VerifyPurchaseCopyDeletionOrder(true, false, true);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure QuoteToOrderSourceCleanupKeepsFilesWhenAutomaticDeletionDisabled()
+    begin
+        VerifyPurchaseCopyDeletionOrder(false, true, false);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure QuoteToOrderDestinationCleanupKeepsFilesWhenAutomaticDeletionDisabled()
+    begin
+        VerifyPurchaseCopyDeletionOrder(false, false, false);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure PostedInvoiceSourceCleanupKeepsFilesWhenAutomaticDeletionDisabled()
+    begin
+        VerifyPurchaseCopyDeletionOrder(true, true, false);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure PostedInvoiceDestinationCleanupKeepsFilesWhenAutomaticDeletionDisabled()
+    begin
+        VerifyPurchaseCopyDeletionOrder(true, false, false);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure MultipleCopyDestinationsKeepFileUntilLegacyFlaggedLastCopyIsDeleted()
+    var
+        SourceHeader: Record "Purchase Header";
+        SourceLine: Record "Purchase Line";
+        FirstHeader: Record "Purchase Header";
+        FirstLine: Record "Purchase Line";
+        SecondHeader: Record "Purchase Header";
+        SecondLine: Record "Purchase Line";
+        SourceAttachment: Record "Document Attachment";
+        FirstAttachment: Record "Document Attachment";
+        SecondAttachment: Record "Document Attachment";
+        DocumentAttachmentMgmt: Codeunit "Document Attachment Mgmt";
+        ExternalFilePath: Text;
+    begin
+        // [SCENARIO] Multiple real copy destinations share one file, including legacy flagged copies
+        Initialize();
+        SetupFileScenarioWithTestConnector();
+        EnableFeatureWithDelete();
+
+        // [GIVEN] A quote attachment copied to two orders
+        CreatePurchaseDocument(SourceHeader, SourceLine, SourceHeader."Document Type"::Quote);
+        CreatePurchaseAttachment(SourceAttachment, SourceHeader, 0);
+        ExternalFilePath := SourceAttachment."External File Path";
+        CreatePurchaseDocument(FirstHeader, FirstLine, FirstHeader."Document Type"::Order);
+        CreatePurchaseDocument(SecondHeader, SecondLine, SecondHeader."Document Type"::Order);
+        DocumentAttachmentMgmt.CopyAttachments(SourceHeader, FirstHeader);
+        DocumentAttachmentMgmt.CopyAttachments(SourceHeader, SecondHeader);
+        GetCopiedAttachment(FirstAttachment, SourceAttachment, Database::"Purchase Header", FirstHeader."No.", Enum::"Attachment Document Type"::Order);
+        GetCopiedAttachment(SecondAttachment, SourceAttachment, Database::"Purchase Header", SecondHeader."No.", Enum::"Attachment Document Type"::Order);
+        AssertCopiedExternalReference(SourceAttachment, FirstAttachment);
+        AssertCopiedExternalReference(SourceAttachment, SecondAttachment);
+        SecondAttachment."Skip Delete On Copy" := true;
+        SecondAttachment.Modify();
+
+        // [WHEN] The source and then the first destination are cleaned up
+        DeletePurchaseDocument(SourceHeader, SourceLine);
+        Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'Source cleanup must keep files referenced by both destinations');
+        DeletePurchaseDocument(FirstHeader, FirstLine);
+
+        // [THEN] The last destination still owns the shared file
+        Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'Deleting one destination must keep the remaining reference');
+        RefreshAttachment(SecondAttachment);
+        Assert.AreEqual(ExternalFilePath, SecondAttachment."External File Path", 'The surviving copy must retain its external path');
+
+        // [WHEN] The final, legacy flagged destination is cleaned up
+        DeletePurchaseDocument(SecondHeader, SecondLine);
+
+        // [THEN] Its legacy flag does not orphan the external file
+        Assert.AreEqual(ExternalFilePath, FileConnectorMock.GetLastDeletedPath(), 'The last destination must delete the file despite its legacy flag');
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure DifferentExternalPathsHaveIndependentLifetimes()
+    var
+        FirstAttachment: Record "Document Attachment";
+        CopiedAttachment: Record "Document Attachment";
+        OtherAttachment: Record "Document Attachment";
+        DAExternalStorageImpl: Codeunit "DA External Storage Impl.";
+        SharedPath: Text;
+        OtherPath: Text;
+    begin
+        // [SCENARIO] An unrelated external path cannot block deletion or be deleted with a shared file
+        Initialize();
+        SetupFileScenarioWithTestConnector();
+        EnableFeatureWithDelete();
+
+        // [GIVEN] Two references to one external path and an attachment with a different path
+        CreateDocumentAttachmentWithContent(FirstAttachment);
+        Assert.IsTrue(DAExternalStorageImpl.UploadToExternalStorage(FirstAttachment), 'First upload should succeed');
+        CreateCopyOfDocumentAttachment(FirstAttachment, CopiedAttachment);
+        CreateDocumentAttachmentWithContent(OtherAttachment);
+        Assert.IsTrue(DAExternalStorageImpl.UploadToExternalStorage(OtherAttachment), 'Other upload should succeed');
+        SharedPath := FirstAttachment."External File Path";
+        OtherPath := OtherAttachment."External File Path";
+        Assert.AreNotEqual(SharedPath, OtherPath, 'Precondition: unrelated files must have different paths');
+
+        // [WHEN] The unrelated attachment is deleted while the shared references survive
+        OtherAttachment.Delete(true);
+
+        // [THEN] Only its own file is deleted
+        Assert.AreEqual(OtherPath, FileConnectorMock.GetLastDeletedPath(), 'A different path must not prevent deleting the unrelated file');
+
+        // [WHEN] One shared reference is deleted
+        FirstAttachment.Delete(true);
+
+        // [THEN] No additional file is deleted
+        Assert.AreEqual(OtherPath, FileConnectorMock.GetLastDeletedPath(), 'The shared path must remain until its final reference is deleted');
+        RefreshAttachment(CopiedAttachment);
+        Assert.AreEqual(SharedPath, CopiedAttachment."External File Path", 'The shared copy must retain its path');
+
+        // [WHEN] The last shared reference is deleted
+        CopiedAttachment.Delete(true);
+
+        // [THEN] Its own file is deleted
+        Assert.AreEqual(SharedPath, FileConnectorMock.GetLastDeletedPath(), 'The final shared reference must delete its file');
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure SharedRecordDeletionKeepsFileWhenAutomaticDeletionDisabled()
+    var
+        SourceAttachment: Record "Document Attachment";
+        CopiedAttachment: Record "Document Attachment";
+        DAExternalStorageImpl: Codeunit "DA External Storage Impl.";
+    begin
+        // [SCENARIO] Automatic deletion disabled keeps the file even after all shared rows are deleted
+        Initialize();
+        SetupFileScenarioWithTestConnector();
+        EnableFeature();
+
+        // [GIVEN] Two attachments sharing an uploaded file
+        CreateDocumentAttachmentWithContent(SourceAttachment);
+        Assert.IsTrue(DAExternalStorageImpl.UploadToExternalStorage(SourceAttachment), 'Upload should succeed');
+        CreateCopyOfDocumentAttachment(SourceAttachment, CopiedAttachment);
+
+        // [WHEN] Both references are deleted
+        SourceAttachment.Delete(true);
+        Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'The first deleted reference must keep the external file');
+        CopiedAttachment.Delete(true);
+
+        // [THEN] The setting prevents deleting even the last external reference
+        Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'Automatic deletion disabled must preserve the file after the last record is deleted');
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure ExplicitRemoveOfSharedFileWithAutomaticDeletionEnabled()
+    begin
+        VerifyExplicitRemoveOfSharedFile(true);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure ExplicitRemoveOfSharedFileWithAutomaticDeletionDisabled()
+    begin
+        VerifyExplicitRemoveOfSharedFile(false);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler')]
+    procedure ExplicitRemoveKeepsFileOwnedByAnotherEnvironment()
+    var
+        DocumentAttachment: Record "Document Attachment";
+        DAExternalStorageImpl: Codeunit "DA External Storage Impl.";
+    begin
+        // [SCENARIO] Explicit removal releases a foreign reference without deleting another environment's file
+        Initialize();
+        SetupFileScenarioWithTestConnector();
+        EnableFeatureWithDelete();
+
+        // [GIVEN] A single external reference owned by another environment
+        CreateDocumentAttachmentWithContent(DocumentAttachment);
+        Assert.IsTrue(DAExternalStorageImpl.UploadToExternalStorage(DocumentAttachment), 'Upload should succeed');
+        DocumentAttachment."Source Environment Hash" := 'DIFFERENTHASH123';
+        DocumentAttachment.Modify();
+
+        // [WHEN] The last local external reference is explicitly removed
+        Assert.IsTrue(DAExternalStorageImpl.DeleteFromExternalStorage(DocumentAttachment), 'Removing a foreign external reference should succeed');
+
+        // [THEN] Its local metadata is cleared without deleting the foreign file
+        AssertExternalMetadataCleared(DocumentAttachment);
+        Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'Ownership must prevent physical deletion even for the last local reference');
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler,SyncMessageHandler')]
+    procedure SyncMoveOfSharedFileWithAutomaticDeletionEnabled()
+    begin
+        VerifySyncMoveOfSharedFile(true);
+    end;
+
+    [Test]
+    [HandlerFunctions('ConfirmYesHandler,SyncMessageHandler')]
+    procedure SyncMoveOfSharedFileWithAutomaticDeletionDisabled()
+    begin
+        VerifySyncMoveOfSharedFile(false);
     end;
 
     #endregion
@@ -993,6 +1236,275 @@ codeunit 136820 "DA Ext. Storage Impl. Tests"
 
     #region Helper Functions
 
+    local procedure VerifyPurchaseCopyDeletionOrder(PostedCopy: Boolean; SourceFirst: Boolean; AutomaticDeletion: Boolean)
+    var
+        SourceHeader: Record "Purchase Header";
+        SourceLine: Record "Purchase Line";
+        DestinationHeader: Record "Purchase Header";
+        DestinationLine: Record "Purchase Line";
+        PurchInvHeader: Record "Purch. Inv. Header";
+        PurchInvLine: Record "Purch. Inv. Line";
+        SourceHeaderAttachment: Record "Document Attachment";
+        SourceLineAttachment: Record "Document Attachment";
+        DestinationHeaderAttachment: Record "Document Attachment";
+        DestinationLineAttachment: Record "Document Attachment";
+        RemainingHeaderAttachment: Record "Document Attachment";
+        RemainingLineAttachment: Record "Document Attachment";
+        DeletedAttachment: Record "Document Attachment";
+        DocumentAttachmentMgmt: Codeunit "Document Attachment Mgmt";
+        FromRecRef: RecordRef;
+        ToRecRef: RecordRef;
+    begin
+        // [SCENARIO] Real purchase attachment copy APIs preserve header and line files through document cleanup in either order
+        Initialize();
+        SetupFileScenarioWithTestConnector();
+        if AutomaticDeletion then
+            EnableFeatureWithDelete()
+        else
+            EnableFeature();
+
+        // [GIVEN] A purchase document with uploaded header and line attachments
+        if PostedCopy then
+            CreatePurchaseDocument(SourceHeader, SourceLine, SourceHeader."Document Type"::Order)
+        else
+            CreatePurchaseDocument(SourceHeader, SourceLine, SourceHeader."Document Type"::Quote);
+        CreatePurchaseAttachment(SourceHeaderAttachment, SourceHeader, 0);
+        CreatePurchaseAttachment(SourceLineAttachment, SourceHeader, SourceLine."Line No.");
+
+        // [GIVEN] Copies created by the actual quote-to-order or posted-document attachment APIs, without financial posting
+        if PostedCopy then begin
+            PurchInvHeader.Init();
+            PurchInvHeader."No." := CopyStr(Any.AlphanumericText(20), 1, MaxStrLen(PurchInvHeader."No."));
+            PurchInvHeader.Insert(false);
+            PurchInvLine.Init();
+            PurchInvLine."Document No." := PurchInvHeader."No.";
+            PurchInvLine."Line No." := SourceLine."Line No.";
+            PurchInvLine.Insert(false);
+            FromRecRef.GetTable(SourceHeader);
+            ToRecRef.GetTable(PurchInvHeader);
+            DocumentAttachmentMgmt.CopyAttachmentsForPostedDocs(FromRecRef, ToRecRef);
+            GetCopiedAttachment(DestinationHeaderAttachment, SourceHeaderAttachment, Database::"Purch. Inv. Header", PurchInvHeader."No.", Enum::"Attachment Document Type"::Invoice);
+            GetCopiedAttachment(DestinationLineAttachment, SourceLineAttachment, Database::"Purch. Inv. Line", PurchInvHeader."No.", Enum::"Attachment Document Type"::Invoice);
+        end else begin
+            CreatePurchaseDocument(DestinationHeader, DestinationLine, DestinationHeader."Document Type"::Order);
+            DocumentAttachmentMgmt.CopyAttachments(SourceHeader, DestinationHeader);
+            DocumentAttachmentMgmt.CopyAttachments(SourceLine, DestinationLine);
+            GetCopiedAttachment(DestinationHeaderAttachment, SourceHeaderAttachment, Database::"Purchase Header", DestinationHeader."No.", Enum::"Attachment Document Type"::Order);
+            GetCopiedAttachment(DestinationLineAttachment, SourceLineAttachment, Database::"Purchase Line", DestinationHeader."No.", Enum::"Attachment Document Type"::Order);
+        end;
+        AssertCopiedExternalReference(SourceHeaderAttachment, DestinationHeaderAttachment);
+        AssertCopiedExternalReference(SourceLineAttachment, DestinationLineAttachment);
+
+        // [WHEN] Either the source or destination document is deleted through its attachment cleanup subscribers
+        if SourceFirst then begin
+            DeletePurchaseDocument(SourceHeader, SourceLine);
+            Assert.IsFalse(DeletedAttachment.GetBySystemId(SourceHeaderAttachment.SystemId), 'Source header attachment should be cleaned up');
+            Assert.IsFalse(DeletedAttachment.GetBySystemId(SourceLineAttachment.SystemId), 'Source line attachment should be cleaned up');
+            RemainingHeaderAttachment := DestinationHeaderAttachment;
+            RemainingLineAttachment := DestinationLineAttachment;
+        end else begin
+            if PostedCopy then begin
+                PurchInvHeader.Delete(false);
+                PurchInvLine.Delete(false);
+            end else
+                DeletePurchaseDocument(DestinationHeader, DestinationLine);
+            Assert.IsFalse(DeletedAttachment.GetBySystemId(DestinationHeaderAttachment.SystemId), 'Destination header attachment should be cleaned up');
+            Assert.IsFalse(DeletedAttachment.GetBySystemId(DestinationLineAttachment.SystemId), 'Destination line attachment should be cleaned up');
+            RemainingHeaderAttachment := SourceHeaderAttachment;
+            RemainingLineAttachment := SourceLineAttachment;
+        end;
+
+        // [THEN] Neither shared file has been deleted and the surviving attachments retain their metadata
+        Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'Document cleanup must not delete files still referenced by another document');
+        RefreshAttachment(RemainingHeaderAttachment);
+        RefreshAttachment(RemainingLineAttachment);
+        Assert.AreEqual(SourceHeaderAttachment."External File Path", RemainingHeaderAttachment."External File Path", 'The surviving header must retain its file');
+        Assert.AreEqual(SourceLineAttachment."External File Path", RemainingLineAttachment."External File Path", 'The surviving line must retain its file');
+        Assert.IsTrue(RemainingHeaderAttachment."Stored Externally", 'The surviving header must remain externally stored');
+        Assert.IsTrue(RemainingLineAttachment."Stored Externally", 'The surviving line must remain externally stored');
+
+        // [WHEN] Each final reference is deleted separately
+        RemainingLineAttachment.Delete(true);
+
+        // [THEN] Final reference deletion respects the automatic deletion setting for each file independently
+        if AutomaticDeletion then
+            Assert.AreEqual(SourceLineAttachment."External File Path", FileConnectorMock.GetLastDeletedPath(), 'The final line reference must delete its file')
+        else
+            Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'Automatic deletion disabled must preserve the file after its final line reference is deleted');
+        RemainingHeaderAttachment.Delete(true);
+        if AutomaticDeletion then
+            Assert.AreEqual(SourceHeaderAttachment."External File Path", FileConnectorMock.GetLastDeletedPath(), 'The final header reference must delete its file')
+        else
+            Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'Automatic deletion disabled must preserve the file after its final header reference is deleted');
+
+        if SourceFirst then
+            if PostedCopy then begin
+                PurchInvHeader.Delete(false);
+                PurchInvLine.Delete(false);
+            end else
+                DeletePurchaseDocument(DestinationHeader, DestinationLine)
+        else
+            DeletePurchaseDocument(SourceHeader, SourceLine);
+    end;
+
+    local procedure CreatePurchaseDocument(var PurchaseHeader: Record "Purchase Header"; var PurchaseLine: Record "Purchase Line"; DocumentType: Enum "Purchase Document Type")
+    begin
+        PurchaseHeader.Init();
+        PurchaseHeader."Document Type" := DocumentType;
+        PurchaseHeader."No." := CopyStr(Any.AlphanumericText(20), 1, MaxStrLen(PurchaseHeader."No."));
+        PurchaseHeader.Insert(false);
+        PurchaseLine.Init();
+        PurchaseLine."Document Type" := DocumentType;
+        PurchaseLine."Document No." := PurchaseHeader."No.";
+        PurchaseLine."Line No." := 10000;
+        PurchaseLine.Insert(false);
+    end;
+
+    local procedure CreatePurchaseAttachment(var DocumentAttachment: Record "Document Attachment"; PurchaseHeader: Record "Purchase Header"; LineNo: Integer)
+    var
+        DAExternalStorageImpl: Codeunit "DA External Storage Impl.";
+        AttachmentDocumentType: Enum "Attachment Document Type";
+        TableId: Integer;
+    begin
+        CreateDocumentAttachmentWithContent(DocumentAttachment);
+        if LineNo = 0 then
+            TableId := Database::"Purchase Header"
+        else
+            TableId := Database::"Purchase Line";
+        AttachmentDocumentType := Enum::"Attachment Document Type".FromInteger(PurchaseHeader."Document Type".AsInteger());
+        DocumentAttachment.Rename(TableId, PurchaseHeader."No.", AttachmentDocumentType, LineNo, DocumentAttachment.ID);
+        Assert.IsTrue(DAExternalStorageImpl.UploadToExternalStorage(DocumentAttachment), 'Purchase attachment upload should succeed');
+        RefreshAttachment(DocumentAttachment);
+    end;
+
+    local procedure GetCopiedAttachment(var CopiedAttachment: Record "Document Attachment"; SourceAttachment: Record "Document Attachment"; TableId: Integer; DocumentNo: Code[20]; DocumentType: Enum "Attachment Document Type")
+    begin
+        CopiedAttachment.Get(TableId, DocumentNo, DocumentType, SourceAttachment."Line No.", SourceAttachment.ID);
+    end;
+
+    local procedure AssertCopiedExternalReference(SourceAttachment: Record "Document Attachment"; CopiedAttachment: Record "Document Attachment")
+    begin
+        Assert.AreNotEqual(SourceAttachment.SystemId, CopiedAttachment.SystemId, 'Copies must be distinct attachment records');
+        Assert.AreEqual(SourceAttachment."External File Path", CopiedAttachment."External File Path", 'Copies must share the external file path');
+        Assert.IsTrue(CopiedAttachment."Stored Externally", 'Copies must remain externally stored');
+        Assert.AreEqual(SourceAttachment."Source Environment Hash", CopiedAttachment."Source Environment Hash", 'Copies must retain ownership metadata');
+        Assert.IsFalse(CopiedAttachment."Skip Delete On Copy", 'New copies must not set the legacy deletion flag');
+    end;
+
+    local procedure DeletePurchaseDocument(var PurchaseHeader: Record "Purchase Header"; var PurchaseLine: Record "Purchase Line")
+    begin
+        // Delete(false) still invokes the document attachment cleanup subscribers, without financial validation.
+        PurchaseHeader.Delete(false);
+        PurchaseLine.Delete(false);
+    end;
+
+    local procedure AssertExternalMetadataCleared(var DocumentAttachment: Record "Document Attachment")
+    begin
+        RefreshAttachment(DocumentAttachment);
+        Assert.IsFalse(DocumentAttachment."Stored Externally", 'The attachment should no longer be externally stored');
+        Assert.AreEqual('', DocumentAttachment."External File Path", 'The external file path should be cleared');
+        Assert.AreEqual(0DT, DocumentAttachment."External Upload Date", 'The external upload date should be cleared');
+    end;
+
+    local procedure VerifyExplicitRemoveOfSharedFile(AutomaticDeletion: Boolean)
+    var
+        SourceAttachment: Record "Document Attachment";
+        CopiedAttachment: Record "Document Attachment";
+        DAExternalStorageImpl: Codeunit "DA External Storage Impl.";
+        ExternalFilePath: Text;
+    begin
+        // [SCENARIO] Explicit external removal releases only the current reference, independent of automatic record deletion
+        Initialize();
+        SetupFileScenarioWithTestConnector();
+        if AutomaticDeletion then
+            EnableFeatureWithDelete()
+        else
+            EnableFeature();
+
+        // [GIVEN] Two attachment records sharing an uploaded file
+        CreateDocumentAttachmentWithContent(SourceAttachment);
+        Assert.IsTrue(DAExternalStorageImpl.UploadToExternalStorage(SourceAttachment), 'Upload should succeed');
+        CreateCopyOfDocumentAttachment(SourceAttachment, CopiedAttachment);
+        ExternalFilePath := SourceAttachment."External File Path";
+
+        // [WHEN] The source external reference is explicitly removed
+        Assert.IsTrue(DAExternalStorageImpl.DeleteFromExternalStorage(SourceAttachment), 'Explicit removal of a shared reference should succeed');
+
+        // [THEN] Only its metadata is cleared and the destination remains usable
+        AssertExternalMetadataCleared(SourceAttachment);
+        Assert.IsTrue(SourceAttachment."Stored Internally", 'Explicit external removal must preserve internal storage');
+        Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'Explicit removal must keep a file referenced by another record');
+        RefreshAttachment(CopiedAttachment);
+        Assert.IsTrue(CopiedAttachment."Stored Externally", 'The other reference should remain externally stored');
+        Assert.AreEqual(ExternalFilePath, CopiedAttachment."External File Path", 'The other reference must retain its path');
+
+        // [WHEN] The destination external reference is explicitly removed
+        Assert.IsTrue(DAExternalStorageImpl.DeleteFromExternalStorage(CopiedAttachment), 'Explicit removal of the last reference should succeed');
+
+        // [THEN] The last reference deletes the file even when automatic record deletion is disabled
+        AssertExternalMetadataCleared(CopiedAttachment);
+        Assert.AreEqual(ExternalFilePath, FileConnectorMock.GetLastDeletedPath(), 'Explicit removal of the final reference must delete its file');
+    end;
+
+    local procedure VerifySyncMoveOfSharedFile(AutomaticDeletion: Boolean)
+    var
+        SourceAttachment: Record "Document Attachment";
+        CopiedAttachment: Record "Document Attachment";
+        DAExternalStorageImpl: Codeunit "DA External Storage Impl.";
+        ExternalFilePath: Text;
+    begin
+        // [SCENARIO] Storage Sync Move to Internal releases shared references and deletes only the final external file
+        Initialize();
+        SetupFileScenarioWithTestConnector();
+        FileConnectorMock.SetFileContent('Content restored from external storage');
+        if AutomaticDeletion then
+            EnableFeatureWithDelete()
+        else
+            EnableFeature();
+
+        // [GIVEN] Two external-only attachment records sharing one file
+        CreateDocumentAttachmentWithContent(SourceAttachment);
+        Assert.IsTrue(DAExternalStorageImpl.UploadToExternalStorage(SourceAttachment), 'Upload should succeed');
+        CreateCopyOfDocumentAttachment(SourceAttachment, CopiedAttachment);
+        ExternalFilePath := SourceAttachment."External File Path";
+        Assert.IsTrue(DAExternalStorageImpl.DeleteFromInternalStorage(SourceAttachment), 'Source internal removal should succeed');
+        Assert.IsTrue(DAExternalStorageImpl.DeleteFromInternalStorage(CopiedAttachment), 'Destination internal removal should succeed');
+
+        // [WHEN] The actual synchronization report moves only the source back to internal storage
+        RunStorageSyncForAttachment(SourceAttachment);
+
+        // [THEN] The source is restored internally and the other external reference is preserved
+        AssertExternalMetadataCleared(SourceAttachment);
+        Assert.IsTrue(SourceAttachment."Stored Internally", 'The source should be restored internally');
+        Assert.IsTrue(SourceAttachment."Document Reference ID".HasValue(), 'The source should have restored content');
+        Assert.AreEqual('', FileConnectorMock.GetLastDeletedPath(), 'Moving one shared reference must not delete the external file');
+        RefreshAttachment(CopiedAttachment);
+        Assert.IsTrue(CopiedAttachment."Stored Externally", 'The remaining reference should still be externally stored');
+        Assert.IsFalse(CopiedAttachment."Stored Internally", 'The report filter must leave the other attachment external-only');
+        Assert.AreEqual(ExternalFilePath, CopiedAttachment."External File Path", 'The remaining reference must retain the shared path');
+
+        // [WHEN] The report moves the final reference back to internal storage
+        RunStorageSyncForAttachment(CopiedAttachment);
+
+        // [THEN] Both moves succeed and the last reference deletes the file regardless of automatic deletion
+        AssertExternalMetadataCleared(CopiedAttachment);
+        Assert.IsTrue(CopiedAttachment."Stored Internally", 'The destination should be restored internally');
+        Assert.IsTrue(CopiedAttachment."Document Reference ID".HasValue(), 'The destination should have restored content');
+        Assert.AreEqual(ExternalFilePath, FileConnectorMock.GetLastDeletedPath(), 'Move must delete the final external file even when automatic deletion is disabled');
+    end;
+
+    local procedure RunStorageSyncForAttachment(var DocumentAttachment: Record "Document Attachment")
+    var
+        AttachmentRecRef: RecordRef;
+        MoveToInternalParametersLbl: Label '<?xml version="1.0" standalone="yes"?><ReportParameters name="DA External Storage Sync" id="%1"><Options><Field name="SyncDirectionField">1</Field><Field name="OperationField">1</Field><Field name="MaxRecordsToProcessField">0</Field></Options><DataItems></DataItems></ReportParameters>', Comment = '%1 = Storage synchronization report ID', Locked = true;
+    begin
+        DocumentAttachment.SetRecFilter();
+        AttachmentRecRef.GetTable(DocumentAttachment);
+        // The report has no parameter setter; Execute supplies its Move options without opening a request page.
+        Report.Execute(Report::"DA External Storage Sync", StrSubstNo(MoveToInternalParametersLbl, Report::"DA External Storage Sync"), AttachmentRecRef);
+        DocumentAttachment.Reset();
+    end;
+
     local procedure Initialize()
     var
         DAExternalStorageSetup: Record "DA External Storage Setup";
@@ -1141,6 +1653,12 @@ codeunit 136820 "DA Ext. Storage Impl. Tests"
     procedure ConfirmYesHandler(Question: Text[1024]; var Reply: Boolean)
     begin
         Reply := true;
+    end;
+
+    [MessageHandler]
+    procedure SyncMessageHandler(Message: Text[1024])
+    begin
+        Assert.AreEqual('Processed 1 attachments successfully. 0 failed.', Message, 'Each filtered synchronization run should move one attachment successfully');
     end;
 
     #endregion
